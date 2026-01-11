@@ -1,0 +1,16 @@
+# Node modules
+node_modules/
+
+# VS Code build output
+out/
+
+# TypeScript build files
+*.js
+*.js.map
+
+# Optional: Ignore any .env or local config files if you use them
+.env
+.vscode/
+
+# Ignore any VSIX packages if you build them locally
+*.vsix

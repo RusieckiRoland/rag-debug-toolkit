@@ -1,0 +1,40 @@
+{
+  "name": "rag-debug-toolkit",
+  "displayName": "RAG Debug Toolkit",
+  "description": "A simple VS Code extension for debugging RAG pipelines.",
+  "version": "0.0.2",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RusieckiRoland/rag-debug-toolkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RusieckiRoland/rag-debug-toolkit/issues"
+  },
+  "homepage": "https://github.com/RusieckiRoland/rag-debug-toolkit#readme",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "main": "./out/extension.js",
+  "activationEvents": ["onLanguage:json",
+  "onLanguage:jsonc"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "renderedPromptViewer.open",
+        "title": "Open rendered_prompt"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "vscode:prepublish": "npm run compile",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.9.3"
+  }
+}
