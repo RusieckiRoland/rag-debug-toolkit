@@ -1,10 +1,13 @@
 import * as vscode from "vscode";
 
 const CMD_OPEN = "renderedPromptViewer.open";
+const CMD_SHOW_DELTA = "renderedPromptViewer.showDelta";
+const CMD_SHOW_STEP_INFO = "renderedPromptViewer.showStepInfo";
 
 type OpenArgs = { line: number; key: "rendered_prompt" | "rendered_chat_messages" };
 
 export function activate(context: vscode.ExtensionContext) {
+  // Open rendered_prompt / rendered_chat_messages
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD_OPEN, async (args?: Partial<OpenArgs>) => {
       const editor = vscode.window.activeTextEditor;
@@ -24,7 +27,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       let value: string;
       try {
-        // 1) Decode the JSON string literal from the log line.
+        // Decode the JSON string literal from the log line.
         value = JSON.parse(extracted.literal);
       } catch {
         vscode.window.showErrorMessage('Failed to decode the string (JSON.parse did not succeed).');
@@ -59,12 +62,63 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Delta view
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_SHOW_DELTA, async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const doc = editor.document;
+      const events = parseTraceEventsFromActiveDocument(doc);
+      if (!events.length) {
+        vscode.window.showWarningMessage("No trace events found in the active document.");
+        return;
+      }
+
+      const md = formatDeltaViewAsMarkdown(events);
+      const outDoc = await vscode.workspace.openTextDocument({
+        content: md,
+        language: "markdown",
+      });
+
+      await vscode.window.showTextDocument(outDoc, { preview: false });
+    })
+  );
+
+  // Step info only view (no state)
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_SHOW_STEP_INFO, async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const doc = editor.document;
+      const events = parseTraceEventsFromActiveDocument(doc);
+      if (!events.length) {
+        vscode.window.showWarningMessage("No trace events found in the active document.");
+        return;
+      }
+
+      const md = formatStepInfoOnlyAsMarkdown(events);
+      const outDoc = await vscode.workspace.openTextDocument({
+        content: md,
+        language: "markdown",
+      });
+
+      await vscode.window.showTextDocument(outDoc, { preview: false });
+    })
+  );
+
+  // CodeLens for rendered_prompt / rendered_chat_messages
+  // Also enabled for generated markdown reports (untitled markdown tabs).
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider(
       [
         { language: "json", scheme: "file" },
         { language: "jsonc", scheme: "file" },
         { pattern: "**/*.jsonl" },
+
+        { language: "markdown", scheme: "untitled" },
+        { language: "markdown", scheme: "file" },
       ],
       new RenderedPromptCodeLensProvider()
     )
@@ -169,4 +223,388 @@ function formatChatMessagesAsMarkdown(messages: any): string {
   }
 
   return parts.join("");
+}
+
+/**
+ * ===== TRACE VIEWS (Delta / Step info only) =====
+ *
+ * Supported inputs:
+ * - JSON file containing { pipeline_trace_events: [...] } OR { trace_events: [...] } OR { events: [...] }
+ * - Raw JSON array of events
+ * - JSONL where each line is a JSON object event
+ */
+
+type TraceEvent = Record<string, any>;
+
+function parseTraceEventsFromActiveDocument(doc: vscode.TextDocument): TraceEvent[] {
+  const text = doc.getText().trim();
+  if (!text) return [];
+
+  // 1) Whole JSON document mode
+  try {
+    const parsed = JSON.parse(text);
+
+    // A) { pipeline_trace_events: [...] } / { trace_events: [...] } / { events: [...] }
+    if (parsed && typeof parsed === "object") {
+      const candidates = [
+        (parsed as any).pipeline_trace_events,
+        (parsed as any).trace_events,
+        (parsed as any).events,
+      ];
+
+      for (const c of candidates) {
+        if (Array.isArray(c)) return c as TraceEvent[];
+      }
+    }
+
+    // B) raw array
+    if (Array.isArray(parsed)) return parsed as TraceEvent[];
+  } catch {
+    // ignore, fallback to JSONL
+  }
+
+  // 2) JSONL mode
+  const lines = text.split(/\r?\n/);
+  const out: TraceEvent[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const o = JSON.parse(t);
+      if (o && typeof o === "object") out.push(o as TraceEvent);
+    } catch {
+      // ignore invalid lines
+    }
+  }
+
+  return out;
+}
+
+function formatDeltaViewAsMarkdown(events: TraceEvent[]): string {
+  const parts: string[] = [];
+  parts.push("# Trace (Delta view)\n");
+  parts.push(
+    "- Full state is shown only for: **START**, **END**, and **ERROR steps**.\n" +
+      "- Between steps, only **changed top-level fields** are displayed.\n"
+  );
+
+  const first = events[0];
+  const last = events[events.length - 1];
+
+  const firstBefore = getStateBefore(first);
+  const firstAfter = getStateAfter(first);
+
+  // START snapshot: prefer state_before if present, otherwise state_after
+  parts.push("## START (full state)\n");
+  parts.push("```json\n");
+  parts.push(JSON.stringify(firstBefore ?? firstAfter ?? null, null, 2));
+  parts.push("\n```\n");
+
+  // walk steps
+  let prevState = firstBefore ?? firstAfter ?? null;
+
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    const stepTitle = formatStepTitle(ev, i);
+
+    const currAfter = getStateAfter(ev);
+    const isErr = isErrorEvent(ev);
+
+    parts.push(`## ${stepTitle}\n`);
+
+    // Compact step header (ts, next_step_id, etc.)
+    parts.push(formatStepHeaderAsMarkdown(ev));
+
+    if (isErr) {
+      parts.push("\n### ERROR: full state\n");
+      parts.push("```json\n");
+      parts.push(JSON.stringify(currAfter ?? null, null, 2));
+      parts.push("\n```\n");
+      prevState = currAfter ?? prevState;
+      continue;
+    }
+
+    if (currAfter == null || prevState == null) {
+      parts.push("\n### Changed fields\n");
+      parts.push("_No state available for diff._\n");
+      prevState = currAfter ?? prevState;
+      continue;
+    }
+
+    const delta = diffTopLevel(prevState, currAfter);
+
+    parts.push("\n### Changed fields\n");
+    if (Object.keys(delta).length === 0) {
+      parts.push("_No changes._\n");
+    } else {
+      parts.push("```json\n");
+      parts.push(JSON.stringify(delta, null, 2));
+      parts.push("\n```\n");
+    }
+
+    prevState = currAfter;
+  }
+
+  // END snapshot
+  const endAfter = getStateAfter(last);
+  parts.push("## END (full state)\n");
+  parts.push("```json\n");
+  parts.push(JSON.stringify(endAfter ?? null, null, 2));
+  parts.push("\n```\n");
+
+  return parts.join("");
+}
+
+function formatStepInfoOnlyAsMarkdown(events: TraceEvent[]): string {
+  const parts: string[] = [];
+  parts.push("# Trace (Step info only)\n");
+  parts.push("- This view omits `state_*` fields and shows only step metadata.\n\n");
+
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    const stepTitle = formatStepTitle(ev, i);
+    parts.push(`## ${stepTitle}\n`);
+
+    const info = stripStateFields(ev);
+
+    parts.push("```json\n");
+    parts.push(JSON.stringify(info, null, 2));
+    parts.push("\n```\n");
+  }
+
+  return parts.join("");
+}
+
+/**
+ * Produces: "1. Id: <stepId>, class: <className>"
+ *
+ * Priority order:
+ * 1) Structured: ev.step.id and ev.action.class (Step info view)
+ * 2) Flat: ev.step_id / ev.action_name (other sources)
+ * 3) Fallback: infer from state_after.step_trace (last element)
+ */
+function formatStepTitle(ev: TraceEvent, index: number): string {
+  const structuredId = asNonEmptyString(ev?.step?.id) ?? "";
+  const structuredClass = asNonEmptyString(ev?.action?.class) ?? "";
+
+  const explicitId =
+    asNonEmptyString(ev.step_id) ??
+    asNonEmptyString(ev.stepId) ??
+    asNonEmptyString(ev.action_step_id) ??
+    "";
+
+  const explicitClass =
+    asNonEmptyString(ev.action_name) ??
+    asNonEmptyString(ev.actionName) ??
+    asNonEmptyString(ev.action) ??
+    asNonEmptyString(ev.type) ??
+    "";
+
+  let inferred = "";
+  const st = getStateAfter(ev);
+  const trace = Array.isArray(st?.step_trace) ? st.step_trace : null;
+  if (trace && trace.length > 0) {
+    inferred = asNonEmptyString(trace[trace.length - 1]) ?? "";
+  }
+
+  const id = structuredId || explicitId || inferred || "step";
+  const cls = structuredClass || explicitClass || inferred || "unknown";
+
+  const prefix = `${index + 1}.`;
+  return `${prefix} Id: ${id}, class: ${cls}`;
+}
+
+function formatStepHeaderAsMarkdown(ev: TraceEvent): string {
+  // Minimal, stable header for delta view.
+  const items: Record<string, any> = {};
+
+  const ts =
+    asNonEmptyString(ev.ts_utc) ??
+    asNonEmptyString(ev.ts) ??
+    asNonEmptyString(ev.timestamp) ??
+    asNonEmptyString(ev.time) ??
+    null;
+
+  if (ts) items.ts_utc = ts;
+
+  const durationMs =
+    typeof ev.duration_ms === "number"
+      ? ev.duration_ms
+      : typeof ev.durationMs === "number"
+      ? ev.durationMs
+      : null;
+
+  if (durationMs != null) items.duration_ms = durationMs;
+
+  const level = asNonEmptyString(ev.level) ?? null;
+  if (level) items.level = level;
+
+  // Try to get "next step" from multiple possible locations
+  const next =
+    asNonEmptyString(ev.out?.next_step_id) ??
+    asNonEmptyString(ev.step?.next_resolved) ??
+    asNonEmptyString(ev.next_step_id) ??
+    asNonEmptyString(ev.nextStepId) ??
+    asNonEmptyString(ev.next) ??
+    null;
+
+  if (next) items.next_step_id = next;
+
+  const note =
+    asNonEmptyString(ev.message) ??
+    asNonEmptyString(ev.note) ??
+    asNonEmptyString(ev.summary) ??
+    null;
+
+  if (note) items.message = truncate(note, 500);
+
+  if (Object.keys(items).length === 0) {
+    return "_(no step header info)_\n";
+  }
+
+  return "```json\n" + JSON.stringify(items, null, 2) + "\n```\n";
+}
+
+function getStateBefore(ev: TraceEvent): any | null {
+  return (
+    ev.state_before ??
+    ev.stateBefore ??
+    ev.pipeline_state_before ??
+    ev.pipelineStateBefore ??
+    null
+  );
+}
+
+function getStateAfter(ev: TraceEvent): any | null {
+  return (
+    ev.state_after ??
+    ev.stateAfter ??
+    ev.pipeline_state_after ??
+    ev.pipelineStateAfter ??
+    ev.state ?? // some logs may use "state"
+    null
+  );
+}
+
+function isErrorEvent(ev: TraceEvent): boolean {
+  const level = asNonEmptyString(ev.level);
+  if (level && level.toUpperCase() === "ERROR") return true;
+
+  if (ev.exception != null) return true;
+  if (ev.error != null) return true;
+  if (ev.has_error === true) return true;
+  if (ev.success === false) return true;
+
+  const ex = asNonEmptyString(ev.exception_message) ?? asNonEmptyString(ev.exceptionMessage);
+  if (ex) return true;
+
+  // Step-info logs commonly have "error": null or error object
+  if (ev.error != null && ev.error !== null) return true;
+
+  return false;
+}
+
+function stripStateFields(ev: TraceEvent): TraceEvent {
+  const out: TraceEvent = {};
+  for (const k of Object.keys(ev)) {
+    if (k === "state_before" || k === "state_after") continue;
+    if (k === "stateBefore" || k === "stateAfter") continue;
+    if (k === "pipeline_state_before" || k === "pipeline_state_after") continue;
+    if (k === "pipelineStateBefore" || k === "pipelineStateAfter") continue;
+    if (k === "state") continue; // keep "step info only" truly without state
+    out[k] = ev[k];
+  }
+  return out;
+}
+
+function diffTopLevel(prevState: any, nextState: any): Record<string, { from: any; to: any }> {
+  const out: Record<string, { from: any; to: any }> = {};
+
+  if (!prevState || !nextState || typeof prevState !== "object" || typeof nextState !== "object") {
+    return out;
+  }
+
+  const keys = new Set<string>([...Object.keys(prevState), ...Object.keys(nextState)]);
+
+  for (const k of keys) {
+    const a = (prevState as any)[k];
+    const b = (nextState as any)[k];
+
+    if (!deepEqual(a, b)) {
+      out[k] = { from: summarizeValue(a), to: summarizeValue(b) };
+    }
+  }
+
+  return out;
+}
+
+function deepEqual(a: any, b: any): boolean {
+  if (a === b) return true;
+
+  if (a == null || b == null) return a === b;
+
+  const ta = typeof a;
+  const tb = typeof b;
+  if (ta !== tb) return false;
+
+  if (ta !== "object") return a === b;
+
+  // arrays
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  // objects
+  const ak = Object.keys(a).sort();
+  const bk = Object.keys(b).sort();
+  if (ak.length !== bk.length) return false;
+
+  for (let i = 0; i < ak.length; i++) {
+    if (ak[i] !== bk[i]) return false;
+    const key = ak[i];
+    if (!deepEqual(a[key], b[key])) return false;
+  }
+
+  return true;
+}
+
+function summarizeValue(v: any): any {
+  // Keep deltas readable: large values become summaries.
+  if (v == null) return v;
+
+  if (typeof v === "string") {
+    return truncate(v, 5000);
+  }
+
+  if (typeof v === "number" || typeof v === "boolean") {
+    return v;
+  }
+
+  if (Array.isArray(v)) {
+    if (v.length <= 20) return v;
+    return { _type: "array", count: v.length };
+  }
+
+  if (typeof v === "object") {
+    const keys = Object.keys(v);
+    if (keys.length <= 30) return v;
+    return { _type: "object", keys: keys.length };
+  }
+
+  return v;
+}
+
+function truncate(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  return s.substring(0, maxLen) + `\n... [truncated, len=${s.length}]`;
+}
+
+function asNonEmptyString(v: any): string | null {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s ? s : null;
 }
