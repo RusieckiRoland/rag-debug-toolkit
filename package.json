@@ -2,7 +2,7 @@
   "name": "rag-debug-toolkit",
   "displayName": "RAG Debug Toolkit",
   "description": "A simple VS Code extension for debugging RAG pipelines.",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -18,8 +18,12 @@
   },
   "categories": ["Other"],
   "main": "./out/extension.js",
-  "activationEvents": ["onLanguage:json",
-  "onLanguage:jsonc"],
+  "activationEvents": [
+    "onLanguage:json",
+    "onLanguage:jsonc",
+    "onLanguage:markdown",
+    "onView:renderedPromptViewer.traceExplorerView"
+  ],
   "contributes": {
     "commands": [
       {
@@ -33,8 +37,24 @@
       {
         "command": "renderedPromptViewer.showStepInfo",
         "title": "Rendered Prompt Viewer: Show Trace (Step info only)"
+      },
+      {
+        "command": "renderedPromptViewer.traceExplorer.refresh",
+        "title": "Rendered Prompt Viewer: Trace Explorer (Refresh)"
+      },
+      {
+        "command": "renderedPromptViewer.traceExplorer.openStepDelta",
+        "title": "Rendered Prompt Viewer: Trace Explorer (Open step delta)"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "renderedPromptViewer.traceExplorerView",
+          "name": "Trace Explorer"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "tsc -p .",
