@@ -32,11 +32,16 @@ A persistent sidebar view that lists pipeline steps from the currently open trac
 - Shows step order, step id, action class, and small key metrics (e.g. `expanded`, `edges`, `node_texts`)
 - Click a step → opens **Step delta** view for the selected step
 - Works automatically with the active editor (switch log file → the list refreshes)
+- A dedicated top row action is always visible: **Open latest trace** → opens `log/pipeline_traces/latest.json` from workspace root
+- For steps with class `CallModelAction`, dedicated child actions are always visible:
+  - **Open messages as MD** → opens `rendered_chat_messages` formatted as Markdown and appends `model_response`
+  - **Copy messages + response** → copies `rendered_chat_messages` + `model_response` to clipboard
 
 Commands:
 
 - **Rendered Prompt Viewer: Trace Explorer (Refresh)**
 - **Rendered Prompt Viewer: Trace Explorer (Open step delta)** *(used internally when clicking a step)*
+- **Rendered Prompt Viewer: Trace Explorer (Open last trace)**
 
 ## Quick Start
 
@@ -87,6 +92,15 @@ Supported input formats:
 Open the Explorer sidebar and look for **Trace Explorer**.  
 It will automatically show steps for the **currently active** trace file.
 
+Use the title-bar button to open the latest trace from:
+
+- workspace root → `log/pipeline_traces/latest.json`
+
+For each `CallModelAction` row you can use child actions:
+
+- **Open messages as MD** (chat messages in Markdown + model response)
+- **Copy messages + response** (chat messages + model response to clipboard)
+
 If you don’t see it:
 
 - open Explorer sidebar (Ctrl+Shift+E)
@@ -95,7 +109,7 @@ If you don’t see it:
 
 ## Version
 
-The extension version is defined in `package.json` (e.g. `0.0.7`) and is the source of truth used by `vsce package`.
+The extension version is defined in `package.json` (current: `0.0.9`) and is the source of truth used by `vsce package`.
 
 ## License
 

@@ -8,6 +8,9 @@ const CMD_SHOW_STEP_INFO = "renderedPromptViewer.showStepInfo";
 const VIEW_TRACE_EXPLORER = "renderedPromptViewer.traceExplorerView";
 const CMD_TRACE_REFRESH = "renderedPromptViewer.traceExplorer.refresh";
 const CMD_TRACE_OPEN_STEP_DELTA = "renderedPromptViewer.traceExplorer.openStepDelta";
+const CMD_TRACE_OPEN_LAST = "renderedPromptViewer.traceExplorer.openLastTrace";
+const CMD_TRACE_OPEN_CALLMODEL_MD = "renderedPromptViewer.traceExplorer.openCallModelMessages";
+const CMD_TRACE_COPY_CALLMODEL = "renderedPromptViewer.traceExplorer.copyCallModelPayload";
 
 type OpenArgs = { line: number; key: "rendered_prompt" | "rendered_chat_messages" };
 type TraceEvent = Record<string, any>;
@@ -158,6 +161,76 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Command: open "<workspace_root>/log/pipeline_traces/latest.json"
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_LAST, async () => {
+      const latestTraceUri = resolveLatestTracePath();
+      if (!latestTraceUri) {
+        vscode.window.showErrorMessage("Workspace root not found.");
+        return;
+      }
+
+      if (!(await fileExists(latestTraceUri))) {
+        vscode.window.showErrorMessage(`File not found: ${latestTraceUri.fsPath}`);
+        return;
+      }
+
+      const outDoc = await vscode.workspace.openTextDocument(latestTraceUri);
+      await vscode.window.showTextDocument(outDoc, { preview: false });
+    })
+  );
+
+  // Command: for CallModelAction node - open rendered_chat_messages (+ model_response) as markdown
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_CALLMODEL_MD, async (args?: { stepIndex?: number }) => {
+      const stepIndex = typeof args?.stepIndex === "number" ? args.stepIndex : -1;
+      if (stepIndex < 0) return;
+
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const events = parseTraceEventsFromActiveDocument(editor.document);
+      if (!events.length || stepIndex >= events.length) return;
+
+      const payload = extractCallModelPayload(events[stepIndex]);
+      if (!payload.renderedChatMessages) {
+        vscode.window.showWarningMessage("rendered_chat_messages not found for this CallModelAction step.");
+        return;
+      }
+
+      const md = formatCallModelPayloadAsMarkdown(payload.renderedChatMessages, payload.modelResponse);
+      const outDoc = await vscode.workspace.openTextDocument({
+        content: md,
+        language: "markdown"
+      });
+      await vscode.window.showTextDocument(outDoc, { preview: false });
+    })
+  );
+
+  // Command: for CallModelAction node - copy rendered_chat_messages (+ model_response) to clipboard
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_TRACE_COPY_CALLMODEL, async (args?: { stepIndex?: number }) => {
+      const stepIndex = typeof args?.stepIndex === "number" ? args.stepIndex : -1;
+      if (stepIndex < 0) return;
+
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const events = parseTraceEventsFromActiveDocument(editor.document);
+      if (!events.length || stepIndex >= events.length) return;
+
+      const payload = extractCallModelPayload(events[stepIndex]);
+      if (!payload.renderedChatMessages) {
+        vscode.window.showWarningMessage("rendered_chat_messages not found for this CallModelAction step.");
+        return;
+      }
+
+      const text = formatCallModelPayloadForClipboard(payload.renderedChatMessages, payload.modelResponse);
+      await vscode.env.clipboard.writeText(text);
+      vscode.window.showInformationMessage("Copied rendered_chat_messages + model_response to clipboard.");
+    })
+  );
+
   // Auto-refresh trace explorer when active editor changes or document changes
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => traceExplorerProvider.refresh()));
 
@@ -223,19 +296,65 @@ class RenderedPromptCodeLensProvider implements vscode.CodeLensProvider {
 }
 
 class TraceStepItem extends vscode.TreeItem {
-  public readonly stepIndex: number;
+  readonly kind: "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
+  readonly stepIndex?: number;
+  readonly isCallModelAction?: boolean;
 
-  constructor(label: string, stepIndex: number, description?: string, tooltip?: string) {
-    super(label, vscode.TreeItemCollapsibleState.None);
-    this.stepIndex = stepIndex;
-    this.description = description;
-    this.tooltip = tooltip;
+  constructor(args: {
+    kind: "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
+    label: string;
+    stepIndex?: number;
+    isCallModelAction?: boolean;
+    description?: string;
+    tooltip?: string;
+  }) {
+    const collapsible =
+      args.kind === "step" && args.isCallModelAction
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.None;
 
-    this.command = {
-      command: CMD_TRACE_OPEN_STEP_DELTA,
-      title: "Open Step Delta",
-      arguments: [{ stepIndex }]
-    };
+    super(args.label, collapsible);
+    this.kind = args.kind;
+    this.stepIndex = args.stepIndex;
+    this.isCallModelAction = args.isCallModelAction;
+    this.description = args.description;
+    this.tooltip = args.tooltip;
+
+    if (args.kind === "openLatest") {
+      this.iconPath = new vscode.ThemeIcon("folder-opened");
+      this.command = { command: CMD_TRACE_OPEN_LAST, title: "Open latest trace" };
+      return;
+    }
+
+    if (args.kind === "step" && typeof args.stepIndex === "number") {
+      this.iconPath = new vscode.ThemeIcon("check");
+      this.command = {
+        command: CMD_TRACE_OPEN_STEP_DELTA,
+        title: "Open Step Delta",
+        arguments: [{ stepIndex: args.stepIndex }]
+      };
+      return;
+    }
+
+    if (args.kind === "callModelOpenMd" && typeof args.stepIndex === "number") {
+      this.iconPath = new vscode.ThemeIcon("book");
+      this.command = {
+        command: CMD_TRACE_OPEN_CALLMODEL_MD,
+        title: "Open messages as markdown",
+        arguments: [{ stepIndex: args.stepIndex }]
+      };
+      return;
+    }
+
+    if (args.kind === "callModelCopy" && typeof args.stepIndex === "number") {
+      this.iconPath = new vscode.ThemeIcon("copy");
+      this.command = {
+        command: CMD_TRACE_COPY_CALLMODEL,
+        title: "Copy messages and response",
+        arguments: [{ stepIndex: args.stepIndex }]
+      };
+      return;
+    }
   }
 }
 
@@ -252,17 +371,38 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
   }
 
   getChildren(element?: TraceStepItem): Thenable<TraceStepItem[]> {
-    // Tree has no nested nodes yet.
-    if (element) return Promise.resolve([]);
+    if (element) {
+      if (element.kind === "step" && element.isCallModelAction && typeof element.stepIndex === "number") {
+        return Promise.resolve([
+          new TraceStepItem({
+            kind: "callModelOpenMd",
+            label: "Open messages as MD",
+            stepIndex: element.stepIndex
+          }),
+          new TraceStepItem({
+            kind: "callModelCopy",
+            label: "Copy messages + response",
+            stepIndex: element.stepIndex
+          })
+        ]);
+      }
+      return Promise.resolve([]);
+    }
+
+    const out: TraceStepItem[] = [
+      new TraceStepItem({
+        kind: "openLatest",
+        label: "Open latest trace",
+        description: "log/pipeline_traces/latest.json"
+      })
+    ];
 
     const editor = vscode.window.activeTextEditor;
-    if (!editor) return Promise.resolve([]);
+    if (!editor) return Promise.resolve(out);
 
     const doc = editor.document;
     const events = parseTraceEventsFromActiveDocument(doc);
-    if (!events.length) return Promise.resolve([]);
-
-    const out: TraceStepItem[] = [];
+    if (!events.length) return Promise.resolve(out);
 
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
@@ -271,6 +411,7 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
       const cls = asNonEmptyString(ev?.action?.class) ?? asNonEmptyString(ev.action_name) ?? "";
 
       const title = `${i + 1}. ${stepId || "step"}${cls ? ` (${cls})` : ""}`;
+      const isCallModelAction = cls.toLowerCase() === "callmodelaction";
 
       const err = isErrorEvent(ev);
       const desc = err ? "ERROR" : "ok";
@@ -289,9 +430,14 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
       const description = extra ? `${desc} | ${extra}` : desc;
       const tooltip = JSON.stringify(stripStateFields(ev), null, 2);
 
-      const item = new TraceStepItem(title, i, description, tooltip);
-
-      // icon
+      const item = new TraceStepItem({
+        kind: "step",
+        label: title,
+        stepIndex: i,
+        isCallModelAction,
+        description,
+        tooltip
+      });
       item.iconPath = err ? new vscode.ThemeIcon("error") : new vscode.ThemeIcon("check");
 
       out.push(item);
@@ -740,4 +886,99 @@ function truncate(s: string, maxLen: number): string {
 function asNonEmptyString(v: any): string | null {
   const s = typeof v === "string" ? v.trim() : "";
   return s ? s : null;
+}
+
+function resolveLatestTracePath(): vscode.Uri | null {
+  const root = getPreferredWorkspaceRoot();
+  if (!root) return null;
+  return vscode.Uri.joinPath(root, "log", "pipeline_traces", "latest.json");
+}
+
+function getPreferredWorkspaceRoot(): vscode.Uri | null {
+  const activeUri = vscode.window.activeTextEditor?.document?.uri;
+  if (activeUri) {
+    const activeWs = vscode.workspace.getWorkspaceFolder(activeUri);
+    if (activeWs) return activeWs.uri;
+  }
+  return vscode.workspace.workspaceFolders?.[0]?.uri ?? null;
+}
+
+function extractCallModelPayload(ev: TraceEvent): { renderedChatMessages: any[] | null; modelResponse: string | null } {
+  const renderedCandidates = [
+    ev?.out?.rendered_chat_messages,
+    ev?.rendered_chat_messages,
+    ev?.action_output?.rendered_chat_messages,
+    getStateAfter(ev)?.rendered_chat_messages
+  ];
+
+  let renderedChatMessages: any[] | null = null;
+  for (const c of renderedCandidates) {
+    if (Array.isArray(c)) {
+      renderedChatMessages = c;
+      break;
+    }
+    if (typeof c === "string") {
+      try {
+        const parsed = JSON.parse(c);
+        if (Array.isArray(parsed)) {
+          renderedChatMessages = parsed;
+          break;
+        }
+      } catch {
+        // ignore invalid candidate
+      }
+    }
+  }
+
+  const modelResponseCandidates = [
+    ev?.out?.model_response,
+    ev?.model_response,
+    ev?.action_output?.model_response,
+    getStateAfter(ev)?.model_response
+  ];
+
+  let modelResponse: string | null = null;
+  for (const c of modelResponseCandidates) {
+    if (typeof c === "string" && c.trim()) {
+      modelResponse = c;
+      break;
+    }
+  }
+
+  return { renderedChatMessages, modelResponse };
+}
+
+function formatCallModelPayloadAsMarkdown(messages: any[], modelResponse: string | null): string {
+  const parts: string[] = [];
+  parts.push(formatChatMessagesAsMarkdown(messages));
+
+  parts.push("\n# model_response\n");
+  if (modelResponse && modelResponse.trim()) {
+    parts.push("```text\n");
+    parts.push(modelResponse);
+    if (!modelResponse.endsWith("\n")) parts.push("\n");
+    parts.push("```\n");
+  } else {
+    parts.push("_model_response is empty or missing._\n");
+  }
+
+  return parts.join("");
+}
+
+function formatCallModelPayloadForClipboard(messages: any[], modelResponse: string | null): string {
+  const parts: string[] = [];
+  parts.push(formatChatMessagesAsMarkdown(messages));
+  parts.push("\n# model_response\n");
+  parts.push(modelResponse ?? "");
+  parts.push("\n");
+  return parts.join("");
+}
+
+async function fileExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
+  }
 }
