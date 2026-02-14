@@ -14,3 +14,5 @@ out/
 
 # Ignore any VSIX packages if you build them locally
 *.vsix
+
+log\

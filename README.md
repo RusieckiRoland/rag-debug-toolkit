@@ -33,6 +33,7 @@ A persistent sidebar view that lists pipeline steps from the currently open trac
 - Click a step → opens **Step delta** view for the selected step
 - Works automatically with the active editor (switch log file → the list refreshes)
 - A dedicated top row action is always visible: **Open latest trace** → opens `log/pipeline_traces/latest.json` from workspace root
+- A dedicated top row action is always visible: **PUML** → builds Activity UML from the trace flow and opens PlantText with encoded diagram
 - For steps with class `CallModelAction`, dedicated child actions are always visible:
   - **Open messages as MD** → opens `rendered_chat_messages` formatted as Markdown and appends `model_response`
   - **Copy messages + response** → copies `rendered_chat_messages` + `model_response` to clipboard
@@ -42,6 +43,7 @@ Commands:
 - **Rendered Prompt Viewer: Trace Explorer (Refresh)**
 - **Rendered Prompt Viewer: Trace Explorer (Open step delta)** *(used internally when clicking a step)*
 - **Rendered Prompt Viewer: Trace Explorer (Open last trace)**
+- **Rendered Prompt Viewer: Trace Explorer (Open PUML diagram)**
 
 ## Quick Start
 
@@ -96,10 +98,56 @@ Use the title-bar button to open the latest trace from:
 
 - workspace root → `log/pipeline_traces/latest.json`
 
+Use the **PUML** top action to generate and open an Activity UML diagram:
+
+- flow is inferred from `next_step_id` / `nextStepId` / similar fields (with sequence fallback)
+- step labels include step name/id, action class, status, elapsed time, and step duration
+- diagram source is sent as PlantUML URL encoding (`deflate` + PlantUML base64 alphabet) in `text=...`
+
+### 5) Custom PUML server URL
+
+You can change the destination server used by the **PUML** action:
+
+- Setting: `renderedPromptViewer.pumlBaseUrl`
+- Default: `https://www.planttext.com`
+- The extension appends `?text=<encoded>` (or `&text=<encoded>` if query already exists)
+
+How to set your own server in VS Code:
+
+1. Open **Settings** (`Ctrl+,`)
+2. Search for: `renderedPromptViewer.pumlBaseUrl`
+3. Set it to your server URL, for example:
+   - `https://puml.mycompany.local`
+   - `https://puml.mycompany.local/render`
+
+You can also set it directly in `.vscode/settings.json`:
+
+```json
+{
+  "renderedPromptViewer.pumlBaseUrl": "https://puml.mycompany.local"
+}
+```
+
 For each `CallModelAction` row you can use child actions:
 
 - **Open messages as MD** (chat messages in Markdown + model response)
 - **Copy messages + response** (chat messages + model response to clipboard)
+
+### 4) Timing and slow actions
+
+In **Trace Explorer**, each step can show:
+
+- elapsed time since trace start
+- step duration (`+...`)
+
+The extension scans other `.json` / `.jsonl` trace files in the same folder as the active trace and builds duration statistics per action class (for example `CallModelAction` is evaluated separately from other actions).
+
+If a step duration is statistically above the expected range for its class, it is marked as **SLOW** and shown with a red clock icon.
+
+Notes:
+
+- if there is not enough historical data in the folder, slow detection is conservative
+- VS Code TreeView does not support coloring only part of a text label, so slow state is indicated by icon + `SLOW` marker
 
 If you don’t see it:
 
@@ -109,7 +157,7 @@ If you don’t see it:
 
 ## Version
 
-The extension version is defined in `package.json` (current: `0.0.9`) and is the source of truth used by `vsce package`.
+The extension version is defined in `package.json` (current: `0.0.14`) and is the source of truth used by `vsce package`.
 
 ## License
 

@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+declare const require: any;
+const deflateRawSync: (data: Uint8Array) => Uint8Array = require("zlib").deflateRawSync;
 
 const CMD_OPEN = "renderedPromptViewer.open";
 const CMD_SHOW_DELTA = "renderedPromptViewer.showDelta";
@@ -9,11 +11,15 @@ const VIEW_TRACE_EXPLORER = "renderedPromptViewer.traceExplorerView";
 const CMD_TRACE_REFRESH = "renderedPromptViewer.traceExplorer.refresh";
 const CMD_TRACE_OPEN_STEP_DELTA = "renderedPromptViewer.traceExplorer.openStepDelta";
 const CMD_TRACE_OPEN_LAST = "renderedPromptViewer.traceExplorer.openLastTrace";
+const CMD_TRACE_OPEN_PUML = "renderedPromptViewer.traceExplorer.openPumlDiagram";
 const CMD_TRACE_OPEN_CALLMODEL_MD = "renderedPromptViewer.traceExplorer.openCallModelMessages";
 const CMD_TRACE_COPY_CALLMODEL = "renderedPromptViewer.traceExplorer.copyCallModelPayload";
 
 type OpenArgs = { line: number; key: "rendered_prompt" | "rendered_chat_messages" };
 type TraceEvent = Record<string, any>;
+const CFG_PUML_BASE_URL = "pumlBaseUrl";
+const CFG_SECTION = "renderedPromptViewer";
+const BUILD_STAMP_UNKNOWN = "build ?";
 
 export function activate(context: vscode.ExtensionContext) {
   // Open rendered_prompt / rendered_chat_messages
@@ -118,8 +124,12 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // Trace Explorer: TreeView in sidebar
-  const traceExplorerProvider = new TraceExplorerProvider();
+  const traceExplorerProvider = new TraceExplorerProvider(BUILD_STAMP_UNKNOWN);
   context.subscriptions.push(vscode.window.registerTreeDataProvider(VIEW_TRACE_EXPLORER, traceExplorerProvider));
+  resolveBuildStamp(context).then((stamp) => {
+    traceExplorerProvider.setBuildStamp(stamp);
+    traceExplorerProvider.refresh();
+  });
 
   // Command: refresh trace explorer
   context.subscriptions.push(
@@ -180,6 +190,29 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Command: generate activity diagram in PUML and open PlantText with Base64 payload.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_PUML, async () => {
+      const events = await loadEventsForPuml();
+      if (!events.length) {
+        vscode.window.showWarningMessage("No trace events found for PUML generation.");
+        return;
+      }
+
+      const puml = buildActivityPuml(events);
+      const target = buildPumlRenderTarget(ensureClosedPuml(puml));
+      if (target.copyPumlToClipboard) {
+        await vscode.env.clipboard.writeText(puml);
+      }
+      await vscode.env.openExternal(target.url);
+      if (target.copyPumlToClipboard) {
+        vscode.window.showWarningMessage(
+          "PUML link is too long for reliable query rendering. PlantUML source was copied to clipboard - paste into PlantText and click Save & Refresh."
+        );
+      }
+    })
+  );
+
   // Command: for CallModelAction node - open rendered_chat_messages (+ model_response) as markdown
   context.subscriptions.push(
     vscode.commands.registerCommand(CMD_TRACE_OPEN_CALLMODEL_MD, async (args?: { stepIndex?: number }) => {
@@ -189,7 +222,7 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
 
-      const events = parseTraceEventsFromActiveDocument(editor.document);
+      const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(editor.document));
       if (!events.length || stepIndex >= events.length) return;
 
       const payload = extractCallModelPayload(events[stepIndex]);
@@ -216,7 +249,7 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
 
-      const events = parseTraceEventsFromActiveDocument(editor.document);
+      const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(editor.document));
       if (!events.length || stepIndex >= events.length) return;
 
       const payload = extractCallModelPayload(events[stepIndex]);
@@ -296,12 +329,12 @@ class RenderedPromptCodeLensProvider implements vscode.CodeLensProvider {
 }
 
 class TraceStepItem extends vscode.TreeItem {
-  readonly kind: "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
+  readonly kind: "openPuml" | "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
   readonly stepIndex?: number;
   readonly isCallModelAction?: boolean;
 
   constructor(args: {
-    kind: "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
+    kind: "openPuml" | "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
     label: string;
     stepIndex?: number;
     isCallModelAction?: boolean;
@@ -319,6 +352,12 @@ class TraceStepItem extends vscode.TreeItem {
     this.isCallModelAction = args.isCallModelAction;
     this.description = args.description;
     this.tooltip = args.tooltip;
+
+    if (args.kind === "openPuml") {
+      this.iconPath = new vscode.ThemeIcon("symbol-class");
+      this.command = { command: CMD_TRACE_OPEN_PUML, title: "Open PUML diagram" };
+      return;
+    }
 
     if (args.kind === "openLatest") {
       this.iconPath = new vscode.ThemeIcon("folder-opened");
@@ -361,16 +400,25 @@ class TraceStepItem extends vscode.TreeItem {
 class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<TraceStepItem | undefined | null | void>();
   readonly onDidChangeTreeData: vscode.Event<TraceStepItem | undefined | null | void> = this._onDidChangeTreeData.event;
+  private buildStamp: string;
+
+  constructor(initialBuildStamp: string) {
+    this.buildStamp = initialBuildStamp;
+  }
 
   refresh(): void {
     this._onDidChangeTreeData.fire();
+  }
+
+  setBuildStamp(stamp: string): void {
+    this.buildStamp = stamp || BUILD_STAMP_UNKNOWN;
   }
 
   getTreeItem(element: TraceStepItem): vscode.TreeItem {
     return element;
   }
 
-  getChildren(element?: TraceStepItem): Thenable<TraceStepItem[]> {
+  async getChildren(element?: TraceStepItem): Promise<TraceStepItem[]> {
     if (element) {
       if (element.kind === "step" && element.isCallModelAction && typeof element.stepIndex === "number") {
         return Promise.resolve([
@@ -391,6 +439,11 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
 
     const out: TraceStepItem[] = [
       new TraceStepItem({
+        kind: "openPuml",
+        label: "PUML",
+        description: "diagram activity"
+      }),
+      new TraceStepItem({
         kind: "openLatest",
         label: "Open latest trace",
         description: "log/pipeline_traces/latest.json"
@@ -401,16 +454,21 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
     if (!editor) return Promise.resolve(out);
 
     const doc = editor.document;
-    const events = parseTraceEventsFromActiveDocument(doc);
+    const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(doc));
     if (!events.length) return Promise.resolve(out);
+    const timing = buildTraceTiming(events);
+    const durationStats = await buildDurationStatsFromFolder(doc.uri);
 
+    let visibleIndex = 0;
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
 
       const stepId = asNonEmptyString(ev?.step?.id) ?? asNonEmptyString(ev.step_id) ?? "";
-      const cls = asNonEmptyString(ev?.action?.class) ?? asNonEmptyString(ev.action_name) ?? "";
+      const cls = getActionClass(ev);
+      if (isUnknownStep(stepId, cls)) continue;
+      visibleIndex++;
 
-      const title = `${i + 1}. ${stepId || "step"}${cls ? ` (${cls})` : ""}`;
+      const title = `${visibleIndex}. ${stepId || "step"}${cls ? ` (${cls})` : ""}`;
       const isCallModelAction = cls.toLowerCase() === "callmodelaction";
 
       const err = isErrorEvent(ev);
@@ -427,7 +485,11 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
         }
       }
 
-      const description = extra ? `${desc} | ${extra}` : desc;
+      const timed = formatTimingForStep(timing, i, cls, durationStats);
+      const parts = [desc];
+      if (timed) parts.push(timed);
+      if (extra) parts.push(extra);
+      const description = parts.join(" | ");
       const tooltip = JSON.stringify(stripStateFields(ev), null, 2);
 
       const item = new TraceStepItem({
@@ -438,7 +500,15 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
         description,
         tooltip
       });
-      item.iconPath = err ? new vscode.ThemeIcon("error") : new vscode.ThemeIcon("check");
+      const stepTiming = timing.steps[i];
+      const isSlow = !err && isStepSlow(stepTiming?.durationMs ?? null, cls, durationStats);
+      if (err) {
+        item.iconPath = new vscode.ThemeIcon("error");
+      } else if (isSlow) {
+        item.iconPath = new vscode.ThemeIcon("clock", new vscode.ThemeColor("errorForeground"));
+      } else {
+        item.iconPath = new vscode.ThemeIcon("check");
+      }
 
       out.push(item);
     }
@@ -521,6 +591,10 @@ function formatChatMessagesAsMarkdown(messages: any): string {
  */
 function parseTraceEventsFromActiveDocument(doc: vscode.TextDocument): TraceEvent[] {
   const text = doc.getText().trim();
+  return parseTraceEventsFromText(text);
+}
+
+function parseTraceEventsFromText(text: string): TraceEvent[] {
   if (!text) return [];
 
   // 1) Whole JSON document mode
@@ -981,4 +1055,562 @@ async function fileExists(uri: vscode.Uri): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+type StepTiming = { startMs: number | null; endMs: number | null; durationMs: number | null; elapsedMs: number | null };
+type DurationStats = { perClass: Map<string, number[]>; global: number[] };
+
+function getActionClass(ev: TraceEvent): string {
+  const raw = asNonEmptyString(ev?.action?.class) ?? asNonEmptyString(ev.action_name) ?? "";
+  return raw.toLowerCase() === "unknown" ? "" : raw;
+}
+
+function parseTsMs(v: any): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) {
+    // if epoch seconds, convert to ms
+    return v < 1e12 ? v * 1000 : v;
+  }
+  if (typeof v !== "string") return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+
+function getEventDurationMs(ev: TraceEvent): number | null {
+  const d =
+    (typeof ev.duration_ms === "number" ? ev.duration_ms : null) ??
+    (typeof ev.durationMs === "number" ? ev.durationMs : null) ??
+    (typeof ev?.timing?.duration_ms === "number" ? ev.timing.duration_ms : null) ??
+    (typeof ev?.timing?.durationMs === "number" ? ev.timing.durationMs : null);
+  return d != null && Number.isFinite(d) && d >= 0 ? d : null;
+}
+
+function getEventEndMs(ev: TraceEvent): number | null {
+  return (
+    parseTsMs(ev.t_ms) ??
+    parseTsMs(ev.ts_ms) ??
+    parseTsMs(ev.ts_utc) ??
+    parseTsMs(ev.ts) ??
+    parseTsMs(ev.timestamp) ??
+    parseTsMs(ev.time) ??
+    parseTsMs(ev.finished_at) ??
+    parseTsMs(ev.end_ts_utc) ??
+    parseTsMs(ev.end_ts)
+  );
+}
+
+function getEventStartMs(ev: TraceEvent): number | null {
+  const explicit =
+    parseTsMs(ev.started_at) ??
+    parseTsMs(ev.start_ts_utc) ??
+    parseTsMs(ev.start_ts) ??
+    parseTsMs(ev.start_time) ??
+    parseTsMs(ev?.timing?.started_at);
+  if (explicit != null) return explicit;
+
+  const end = getEventEndMs(ev);
+  const dur = getEventDurationMs(ev);
+  if (end != null && dur != null) return end - dur;
+  return null;
+}
+
+function buildTraceTiming(events: TraceEvent[]): { traceStartMs: number | null; steps: StepTiming[] } {
+  const starts = events.map((e) => getEventStartMs(e)).filter((x): x is number => x != null);
+  const ends = events.map((e) => getEventEndMs(e)).filter((x): x is number => x != null);
+  const traceStartMs = starts.length ? Math.min(...starts) : ends.length ? Math.min(...ends) : null;
+
+  // For traces with CONSUME events: duration(step) = step_end - consume_for_same_step
+  // This yields realistic step duration even when explicit duration_ms is absent.
+  const consumeQueue = new Map<string, number[]>();
+  for (const ev of events) {
+    const kind = asNonEmptyString(ev.event_type)?.toUpperCase() ?? "";
+    if (kind !== "CONSUME") continue;
+    const sid = asNonEmptyString(ev.consumer_step_id) ?? "";
+    const end = getEventEndMs(ev);
+    if (!sid || end == null) continue;
+    if (!consumeQueue.has(sid)) consumeQueue.set(sid, []);
+    consumeQueue.get(sid)!.push(end);
+  }
+
+  let prevEndMs: number | null = null;
+  const steps: StepTiming[] = events.map((ev) => {
+    const explicitDuration = getEventDurationMs(ev);
+    const endMs = getEventEndMs(ev);
+    let startMs = getEventStartMs(ev);
+
+    const stepId = asNonEmptyString(ev?.step?.id) ?? asNonEmptyString(ev.step_id) ?? "";
+    if (stepId) {
+      const q = consumeQueue.get(stepId);
+      if (q && q.length && endMs != null) {
+        const idx = q.findIndex((v) => v <= endMs);
+        if (idx >= 0) {
+          startMs = q[idx];
+          q.splice(idx, 1);
+        }
+      }
+    }
+
+    if (startMs == null && prevEndMs != null) startMs = prevEndMs;
+    const durationMs =
+      explicitDuration != null
+        ? explicitDuration
+        : startMs != null && endMs != null && endMs >= startMs
+          ? endMs - startMs
+          : null;
+    const elapsedMs = traceStartMs != null && endMs != null ? endMs - traceStartMs : null;
+    prevEndMs = endMs ?? prevEndMs;
+    return { startMs, endMs, durationMs, elapsedMs };
+  });
+
+  return { traceStartMs, steps };
+}
+
+async function buildDurationStatsFromFolder(docUri: vscode.Uri): Promise<DurationStats> {
+  const perClass = new Map<string, number[]>();
+  const global: number[] = [];
+
+  if (docUri.scheme !== "file") return { perClass, global };
+
+  const folderUri = parentDir(docUri);
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(folderUri);
+  } catch {
+    return { perClass, global };
+  }
+
+  const files = entries
+    .filter(([name, t]) => t === vscode.FileType.File && /\.(json|jsonl)$/i.test(name))
+    .slice(0, 120);
+
+  for (const [name] of files) {
+    const uri = vscode.Uri.joinPath(folderUri, name);
+    let text = "";
+    try {
+      text = await readUtf8(uri);
+    } catch {
+      continue;
+    }
+    if (!text || text.length > 20 * 1024 * 1024) continue;
+
+    const events = parseTraceEventsFromText(text.trim());
+    for (const ev of events) {
+      const cls = getActionClass(ev).toLowerCase();
+      const d = getEventDurationMs(ev);
+      if (d == null || !Number.isFinite(d) || d < 0) continue;
+      if (!perClass.has(cls)) perClass.set(cls, []);
+      perClass.get(cls)!.push(d);
+      global.push(d);
+    }
+  }
+
+  return { perClass, global };
+}
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return 0;
+  const v = [...values].sort((a, b) => a - b);
+  const idx = Math.max(0, Math.min(v.length - 1, Math.floor((v.length - 1) * p)));
+  return v[idx];
+}
+
+function allowedDurationMs(cls: string, stats: DurationStats): number | null {
+  const classVals = stats.perClass.get(cls.toLowerCase()) ?? [];
+  const source = classVals.length >= 6 ? classVals : stats.global;
+  if (source.length < 6) return null;
+
+  const med = percentile(source, 0.5);
+  const p90 = percentile(source, 0.9);
+  return Math.max(150, med * 2.2, p90 * 1.25);
+}
+
+function isStepSlow(durationMs: number | null, cls: string, stats: DurationStats): boolean {
+  if (durationMs == null) return false;
+  const allowed = allowedDurationMs(cls, stats);
+  if (allowed == null) return false;
+  return durationMs > allowed;
+}
+
+function formatSeconds(ms: number): string {
+  const s = ms / 1000;
+  if (s < 1) return `${s.toFixed(2).replace(".", ",")}s`;
+  if (s < 10) return `${s.toFixed(1).replace(".", ",")}s`;
+  return `${Math.round(s)}s`;
+}
+
+function formatTimingForStep(
+  timing: { traceStartMs: number | null; steps: StepTiming[] },
+  index: number,
+  cls: string,
+  stats: DurationStats
+): string | null {
+  const t = timing.steps[index];
+  if (!t) return null;
+
+  const parts: string[] = [];
+  if (t.elapsedMs != null && t.elapsedMs >= 0) {
+    parts.push(`t=${formatSeconds(t.elapsedMs)}`);
+  }
+
+  if (t.durationMs != null && t.durationMs >= 0) {
+    const dur = `+${formatSeconds(t.durationMs)}`;
+    parts.push(isStepSlow(t.durationMs, cls, stats) ? `[SLOW] ${dur}` : dur);
+  }
+
+  return parts.length ? parts.join(", ") : null;
+}
+
+function parentDir(uri: vscode.Uri): vscode.Uri {
+  const p = uri.path;
+  const idx = p.lastIndexOf("/");
+  if (idx <= 0) return uri.with({ path: "/" });
+  return uri.with({ path: p.substring(0, idx) });
+}
+
+async function readUtf8(uri: vscode.Uri): Promise<string> {
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  const DecoderCtor = (globalThis as any).TextDecoder;
+  if (typeof DecoderCtor === "function") {
+    return new DecoderCtor("utf-8").decode(bytes);
+  }
+  return Array.from(bytes)
+    .map((b) => String.fromCharCode(b))
+    .join("");
+}
+
+function buildPumlRenderTarget(puml: string): { url: vscode.Uri; copyPumlToClipboard: boolean } {
+  const cfg = vscode.workspace.getConfiguration(CFG_SECTION);
+  const rawBase = asNonEmptyString(cfg.get<string>(CFG_PUML_BASE_URL)) ?? "https://www.planttext.com";
+  const base = rawBase.trim() || "https://www.planttext.com";
+  const sep = base.includes("?") ? "&" : "?";
+  const encoded = encodePlantUmlForUrl(puml);
+  const full = `${base}${sep}text=${encoded}`;
+
+  // Some browsers/sites truncate very long query strings, resulting in empty PlantText editor.
+  // In that case open base URL and copy source to clipboard.
+  if (full.length > 7000) {
+    const noQuery = base.split("?")[0] || "https://www.planttext.com";
+    return { url: vscode.Uri.parse(noQuery), copyPumlToClipboard: true };
+  }
+
+  return { url: vscode.Uri.parse(full), copyPumlToClipboard: false };
+}
+
+function ensureClosedPuml(puml: string): string {
+  const rows = puml.split(/\r?\n/).map((x) => x.trimEnd());
+  const hasEndNote = rows.some((r) => r.trim().toLowerCase() === "end note");
+  const hasNoteRight = rows.some((r) => r.trim().toLowerCase() === "note right");
+  const hasStop = rows.some((r) => r.trim().toLowerCase() === "stop");
+  const hasEndUml = rows.some((r) => r.trim().toLowerCase() === "@enduml");
+
+  // If there is a note block marker but no explicit close, close it defensively.
+  if (hasNoteRight && !hasEndNote) rows.push("end note");
+  if (!hasStop) rows.push("stop");
+  if (!hasEndUml) rows.push("@enduml");
+  return rows.join("\n");
+}
+
+function encodePlantUmlForUrl(text: string): string {
+  const compressed = deflateRawSync(utf8Bytes(text));
+  return plantUmlEncodeBytes(compressed);
+}
+
+function utf8Bytes(text: string): Uint8Array {
+  const encoded = encodeURIComponent(text);
+  const out: number[] = [];
+  for (let i = 0; i < encoded.length; i += 1) {
+    const ch = encoded[i];
+    if (ch === "%") {
+      const hex = encoded.slice(i + 1, i + 3);
+      out.push(parseInt(hex, 16));
+      i += 2;
+      continue;
+    }
+    out.push(ch.charCodeAt(0));
+  }
+  return new Uint8Array(out);
+}
+
+function plantUmlEncodeBytes(data: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < data.length; i += 3) {
+    const b1 = data[i] ?? 0;
+    const b2 = data[i + 1] ?? 0;
+    const b3 = data[i + 2] ?? 0;
+    out += append3bytes(b1, b2, b3);
+  }
+  return out;
+}
+
+function append3bytes(b1: number, b2: number, b3: number): string {
+  const c1 = b1 >> 2;
+  const c2 = ((b1 & 0x3) << 4) | (b2 >> 4);
+  const c3 = ((b2 & 0xf) << 2) | (b3 >> 6);
+  const c4 = b3 & 0x3f;
+  return `${encode6bit(c1 & 0x3f)}${encode6bit(c2 & 0x3f)}${encode6bit(c3 & 0x3f)}${encode6bit(c4 & 0x3f)}`;
+}
+
+function encode6bit(b: number): string {
+  if (b < 10) return String.fromCharCode(48 + b);
+  if (b < 36) return String.fromCharCode(65 + (b - 10));
+  if (b < 62) return String.fromCharCode(97 + (b - 36));
+  if (b === 62) return "-";
+  if (b === 63) return "_";
+  return "?";
+}
+
+async function loadEventsForPuml(): Promise<TraceEvent[]> {
+  const editor = vscode.window.activeTextEditor;
+  if (editor) {
+    const events = parseTraceEventsFromActiveDocument(editor.document);
+    const filtered = normalizeEventsForPuml(events);
+    if (filtered.length) return filtered;
+  }
+
+  const latestUri = resolveLatestTracePath();
+  if (!latestUri || !(await fileExists(latestUri))) return [];
+
+  try {
+    const text = await readUtf8(latestUri);
+    const events = parseTraceEventsFromText(text.trim());
+    return normalizeEventsForPuml(events);
+  } catch {
+    return [];
+  }
+}
+
+function normalizeEventsForPuml(events: TraceEvent[]): TraceEvent[] {
+  // Prefer strict execution-step events (step id + concrete action class),
+  // because mixed traces may include synthetic/helper records that break loop detection.
+  const strict = events.filter(isStructuralStepEvent);
+  if (strict.length >= 3) return strict;
+
+  // Fallback for sparse traces where action class is not always present.
+  return events.filter((ev) => {
+    const stepId = asNonEmptyString(ev?.step?.id) ?? asNonEmptyString(ev.step_id) ?? "";
+    const cls = getActionClass(ev);
+    if (cls.trim().toLowerCase() === "action") return false;
+    return !isUnknownStep(stepId, cls);
+  });
+}
+
+function isStructuralStepEvent(ev: TraceEvent): boolean {
+  const stepId = asNonEmptyString(ev?.step?.id) ?? asNonEmptyString(ev.step_id) ?? "";
+  const cls = asNonEmptyString(ev?.action?.class) ?? "";
+  const normalized = cls.trim().toLowerCase();
+  if (!stepId || !cls) return false;
+  if (normalized === "unknown" || normalized === "action") return false;
+  return true;
+}
+
+function buildActivityPuml(events: TraceEvent[]): string {
+  type Node = {
+    idx: number;
+    key: string;
+    stepId: string;
+    actionClass: string;
+    status: string;
+    nextStepId: string | null;
+    elapsedMs: number | null;
+    durationMs: number | null;
+  };
+
+  const timing = buildTraceTiming(events);
+  const nodes: Node[] = events.map((ev, i) => {
+    const stepId = asNonEmptyString(ev?.step?.id) ?? asNonEmptyString(ev.step_id) ?? `step_${i + 1}`;
+    const actionClass = getActionClass(ev);
+    const status = isErrorEvent(ev) ? "ERROR" : "ok";
+    const nextStepId = getNextStepId(ev);
+    const t = timing.steps[i];
+    return {
+      idx: i,
+      key: `${stepId}::${actionClass || "action"}`,
+      stepId,
+      actionClass: actionClass || "action",
+      status,
+      nextStepId,
+      elapsedMs: t?.elapsedMs ?? null,
+      durationMs: t?.durationMs ?? null
+    };
+  });
+
+  const byStepId = new Map<string, number[]>();
+  for (const n of nodes) {
+    if (!byStepId.has(n.stepId)) byStepId.set(n.stepId, []);
+    byStepId.get(n.stepId)!.push(n.idx);
+  }
+  const repeatedSteps = Array.from(byStepId.entries())
+    .filter(([, indexes]) => indexes.length > 1)
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+
+  const edges = new Map<number, Set<number>>();
+  for (const n of nodes) {
+    let target: number | null = null;
+    if (n.nextStepId && byStepId.has(n.nextStepId)) {
+      const candidates = byStepId.get(n.nextStepId)!;
+      target = candidates.find((idx) => idx > n.idx) ?? candidates[0] ?? null;
+    } else if (n.idx + 1 < nodes.length) {
+      target = n.idx + 1;
+    }
+    if (target != null) {
+      if (!edges.has(n.idx)) edges.set(n.idx, new Set<number>());
+      edges.get(n.idx)!.add(target);
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push("@startuml");
+  lines.push("title Trace Activity Flow (observed run)");
+
+  if (!nodes.length) {
+    lines.push("start");
+    lines.push(":No events;");
+    lines.push("stop");
+    lines.push("@enduml");
+    return lines.join("\n");
+  }
+
+  lines.push("start");
+  const stepLine = (n: Node): string => {
+    const elapsed = n.elapsedMs != null && n.elapsedMs >= 0 ? formatSeconds(n.elapsedMs) : "?";
+    const duration = n.durationMs != null && n.durationMs >= 0 ? formatSeconds(n.durationMs) : "?";
+    const body = `${n.idx + 1}. ${n.stepId} (${n.actionClass})\\nstatus=${n.status} | t=${elapsed} | +${duration}`;
+    return `:${escapePumlLabel(body)};`;
+  };
+
+  type ObservedIteration = { start: number; endExclusive: number; iterationNo: number };
+  const detectObservedIterations = (): ObservedIteration[] => {
+    let chosenIndexes: number[] | null = null;
+    let bestCoverage = -1;
+    let bestFirst = Number.MAX_SAFE_INTEGER;
+
+    for (const [, indexes] of byStepId.entries()) {
+      if (indexes.length < 3) continue; // at least 2 full observed iterations
+      let coverage = 0;
+      let valid = true;
+      for (let i = 0; i < indexes.length - 1; i += 1) {
+        const gap = indexes[i + 1] - indexes[i];
+        if (gap <= 0) {
+          valid = false;
+          break;
+        }
+        coverage += gap;
+      }
+      if (!valid) continue;
+      const first = indexes[0];
+      if (coverage > bestCoverage || (coverage === bestCoverage && first < bestFirst)) {
+        bestCoverage = coverage;
+        bestFirst = first;
+        chosenIndexes = indexes;
+      }
+    }
+
+    if (!chosenIndexes) return [];
+    const out: ObservedIteration[] = [];
+    for (let i = 0; i < chosenIndexes.length - 1; i += 1) {
+      out.push({
+        start: chosenIndexes[i],
+        endExclusive: chosenIndexes[i + 1],
+        iterationNo: i + 1
+      });
+    }
+    return out;
+  };
+
+  const iterations = detectObservedIterations();
+  const iterByStart = new Map<number, ObservedIteration>();
+  for (const it of iterations) iterByStart.set(it.start, it);
+
+  let i = 0;
+  while (i < nodes.length) {
+    const it = iterByStart.get(i);
+    if (!it) {
+      lines.push(stepLine(nodes[i]));
+      i += 1;
+      continue;
+    }
+    lines.push(`partition "Loop iteration #${it.iterationNo} (observed)" {`);
+    for (let k = it.start; k < it.endExclusive; k += 1) {
+      lines.push(stepLine(nodes[k]));
+    }
+    lines.push("}");
+    i = it.endExclusive;
+  }
+
+  const jumps = Array.from(edges.entries()).flatMap(([from, tos]) =>
+    Array.from(tos).map((to) => `${nodes[from].stepId} -> ${nodes[to].stepId}`)
+  );
+  if (jumps.length) {
+    lines.push("note right");
+    lines.push("Flow edges (inferred):");
+    for (const j of jumps.slice(0, 80)) {
+      lines.push(`- ${escapePumlLabel(j)}`);
+    }
+    if (jumps.length > 80) lines.push(`- ... and ${jumps.length - 80} more`);
+    if (repeatedSteps.length) {
+      lines.push("");
+      lines.push("Repeated steps (loop signal):");
+      for (const [stepId, indexes] of repeatedSteps.slice(0, 20)) {
+        const positions = indexes.slice(0, 8).map((idx) => idx + 1).join(", ");
+        const suffix = indexes.length > 8 ? ", ..." : "";
+        lines.push(`- ${escapePumlLabel(`${stepId} x${indexes.length} @ [${positions}${suffix}]`)}`);
+      }
+      if (repeatedSteps.length > 20) lines.push(`- ... and ${repeatedSteps.length - 20} more`);
+    }
+    lines.push("end note");
+  } else if (repeatedSteps.length) {
+    lines.push("note right");
+    lines.push("Repeated steps (loop signal):");
+    for (const [stepId, indexes] of repeatedSteps.slice(0, 20)) {
+      const positions = indexes.slice(0, 8).map((idx) => idx + 1).join(", ");
+      const suffix = indexes.length > 8 ? ", ..." : "";
+      lines.push(`- ${escapePumlLabel(`${stepId} x${indexes.length} @ [${positions}${suffix}]`)}`);
+    }
+    if (repeatedSteps.length > 20) lines.push(`- ... and ${repeatedSteps.length - 20} more`);
+    lines.push("end note");
+  }
+  lines.push("stop");
+  lines.push("@enduml");
+  return lines.join("\n");
+}
+
+function escapePumlLabel(s: string): string {
+  return s.replace(/"/g, "'");
+}
+
+function getNextStepId(ev: TraceEvent): string | null {
+  return (
+    asNonEmptyString(ev.out?.next_step_id) ??
+    asNonEmptyString(ev.step?.next_resolved) ??
+    asNonEmptyString(ev.next_step_id) ??
+    asNonEmptyString(ev.nextStepId) ??
+    asNonEmptyString(ev.next) ??
+    null
+  );
+}
+
+function isUnknownStep(stepId: string, cls: string): boolean {
+  const s = stepId.trim().toLowerCase();
+  const c = cls.trim().toLowerCase();
+  return (!s || s === "step" || s === "unknown") && (!c || c === "unknown");
+}
+
+async function resolveBuildStamp(context: vscode.ExtensionContext): Promise<string> {
+  try {
+    const compiledUri = vscode.Uri.joinPath(context.extensionUri, "out", "extension.js");
+    const stat = await vscode.workspace.fs.stat(compiledUri);
+    return `build ${formatBuildDate(stat.mtime)}`;
+  } catch {
+    return BUILD_STAMP_UNKNOWN;
+  }
+}
+
+function formatBuildDate(ms: number): string {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  const hh = `${d.getHours()}`.padStart(2, "0");
+  const mm = `${d.getMinutes()}`.padStart(2, "0");
+  const ss = `${d.getSeconds()}`.padStart(2, "0");
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }

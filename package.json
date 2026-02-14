@@ -2,7 +2,7 @@
   "name": "rag-debug-toolkit",
   "displayName": "RAG Debug Toolkit",
   "description": "A simple VS Code extension for debugging RAG pipelines.",
-  "version": "0.0.9",
+  "version": "0.0.14",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -16,7 +16,9 @@
   "engines": {
     "vscode": "^1.80.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "main": "./out/extension.js",
   "activationEvents": [
     "onLanguage:json",
@@ -51,6 +53,10 @@
         "title": "Rendered Prompt Viewer: Trace Explorer (Open last trace)"
       },
       {
+        "command": "renderedPromptViewer.traceExplorer.openPumlDiagram",
+        "title": "Rendered Prompt Viewer: Trace Explorer (Open PUML diagram)"
+      },
+      {
         "command": "renderedPromptViewer.traceExplorer.openCallModelMessages",
         "title": "Rendered Prompt Viewer: Trace Explorer (Open messages as MD)"
       },
@@ -66,6 +72,16 @@
           "name": "Trace Explorer"
         }
       ]
+    },
+    "configuration": {
+      "title": "RAG Debug Toolkit",
+      "properties": {
+        "renderedPromptViewer.pumlBaseUrl": {
+          "type": "string",
+          "default": "https://www.planttext.com",
+          "description": "Base URL for rendering generated PUML diagrams. The extension appends query parameter 'text=<encoded-diagram>'."
+        }
+      }
     }
   },
   "scripts": {
