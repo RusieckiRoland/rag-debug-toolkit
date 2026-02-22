@@ -222,7 +222,7 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
 
-      const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(editor.document));
+      const events = parseTraceEventsFromActiveDocument(editor.document);
       if (!events.length || stepIndex >= events.length) return;
 
       const payload = extractCallModelPayload(events[stepIndex]);
@@ -249,7 +249,7 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
 
-      const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(editor.document));
+      const events = parseTraceEventsFromActiveDocument(editor.document);
       if (!events.length || stepIndex >= events.length) return;
 
       const payload = extractCallModelPayload(events[stepIndex]);
@@ -454,8 +454,14 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
     if (!editor) return Promise.resolve(out);
 
     const doc = editor.document;
-    const events = normalizeEventsForPuml(parseTraceEventsFromActiveDocument(doc));
+    const sourceEvents = parseTraceEventsFromActiveDocument(doc);
+    const events = normalizeEventsForPuml(sourceEvents);
     if (!events.length) return Promise.resolve(out);
+    const sourceIndexByEvent = new Map<TraceEvent, number>();
+    for (let sourceIndex = 0; sourceIndex < sourceEvents.length; sourceIndex++) {
+      sourceIndexByEvent.set(sourceEvents[sourceIndex], sourceIndex);
+    }
+
     const timing = buildTraceTiming(events);
     const durationStats = await buildDurationStatsFromFolder(doc.uri);
 
@@ -495,7 +501,7 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
       const item = new TraceStepItem({
         kind: "step",
         label: title,
-        stepIndex: i,
+        stepIndex: sourceIndexByEvent.get(ev) ?? i,
         isCallModelAction,
         description,
         tooltip
