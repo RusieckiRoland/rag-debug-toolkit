@@ -17,6 +17,7 @@ const CMD_TRACE_COPY_CALLMODEL = "renderedPromptViewer.traceExplorer.copyCallMod
 
 type OpenArgs = { line: number; key: "rendered_prompt" | "rendered_chat_messages" };
 type TraceEvent = Record<string, any>;
+type TraceCommandArgs = { stepIndex?: number; documentUri?: string };
 const CFG_PUML_BASE_URL = "pumlBaseUrl";
 const CFG_SECTION = "renderedPromptViewer";
 const BUILD_STAMP_UNKNOWN = "build ?";
@@ -140,17 +141,16 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: open delta for selected step
   context.subscriptions.push(
-    vscode.commands.registerCommand(CMD_TRACE_OPEN_STEP_DELTA, async (args?: { stepIndex?: number }) => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        vscode.window.showWarningMessage("No active editor.");
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_STEP_DELTA, async (args?: TraceCommandArgs) => {
+      const doc = await resolveTraceDocument(args?.documentUri);
+      if (!doc) {
+        vscode.window.showWarningMessage("Trace source document not found.");
         return;
       }
 
-      const doc = editor.document;
       const events = parseTraceEventsFromActiveDocument(doc);
       if (!events.length) {
-        vscode.window.showWarningMessage("No trace events found in the active document.");
+        vscode.window.showWarningMessage("No trace events found in the selected trace document.");
         return;
       }
 
@@ -161,13 +161,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       const md = formatSingleStepDeltaAsMarkdown(events, idx);
-
-      const outDoc = await vscode.workspace.openTextDocument({
-        content: md,
-        language: "markdown"
-      });
-
-      await vscode.window.showTextDocument(outDoc, { preview: false });
+      await showMarkdownContent(md, true);
     })
   );
 
@@ -192,8 +186,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: generate activity diagram in PUML and open PlantText with Base64 payload.
   context.subscriptions.push(
-    vscode.commands.registerCommand(CMD_TRACE_OPEN_PUML, async () => {
-      const events = await loadEventsForPuml();
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_PUML, async (args?: TraceCommandArgs) => {
+      const events = await loadEventsForPuml(args?.documentUri);
       if (!events.length) {
         vscode.window.showWarningMessage("No trace events found for PUML generation.");
         return;
@@ -213,54 +207,50 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Command: for CallModelAction node - open rendered_chat_messages (+ model_response) as markdown
+  // Command: for CallModelAction node - open available model payload as markdown
   context.subscriptions.push(
-    vscode.commands.registerCommand(CMD_TRACE_OPEN_CALLMODEL_MD, async (args?: { stepIndex?: number }) => {
+    vscode.commands.registerCommand(CMD_TRACE_OPEN_CALLMODEL_MD, async (args?: TraceCommandArgs) => {
       const stepIndex = typeof args?.stepIndex === "number" ? args.stepIndex : -1;
       if (stepIndex < 0) return;
 
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
+      const doc = await resolveTraceDocument(args?.documentUri);
+      if (!doc) return;
 
-      const events = parseTraceEventsFromActiveDocument(editor.document);
+      const events = parseTraceEventsFromActiveDocument(doc);
       if (!events.length || stepIndex >= events.length) return;
 
-      const payload = extractCallModelPayload(events[stepIndex]);
-      if (!payload.renderedChatMessages) {
-        vscode.window.showWarningMessage("rendered_chat_messages not found for this CallModelAction step.");
+      const payload = extractCallModelPayloadForStep(events, stepIndex);
+      if (!hasCallModelPayload(payload)) {
+        vscode.window.showWarningMessage("No model payload found for this CallModelAction step.");
         return;
       }
 
       const md = formatCallModelPayloadAsMarkdown(payload.renderedChatMessages, payload.modelResponse);
-      const outDoc = await vscode.workspace.openTextDocument({
-        content: md,
-        language: "markdown"
-      });
-      await vscode.window.showTextDocument(outDoc, { preview: false });
+      await showMarkdownContent(md, true);
     })
   );
 
-  // Command: for CallModelAction node - copy rendered_chat_messages (+ model_response) to clipboard
+  // Command: for CallModelAction node - copy available model payload to clipboard
   context.subscriptions.push(
-    vscode.commands.registerCommand(CMD_TRACE_COPY_CALLMODEL, async (args?: { stepIndex?: number }) => {
+    vscode.commands.registerCommand(CMD_TRACE_COPY_CALLMODEL, async (args?: TraceCommandArgs) => {
       const stepIndex = typeof args?.stepIndex === "number" ? args.stepIndex : -1;
       if (stepIndex < 0) return;
 
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
+      const doc = await resolveTraceDocument(args?.documentUri);
+      if (!doc) return;
 
-      const events = parseTraceEventsFromActiveDocument(editor.document);
+      const events = parseTraceEventsFromActiveDocument(doc);
       if (!events.length || stepIndex >= events.length) return;
 
-      const payload = extractCallModelPayload(events[stepIndex]);
-      if (!payload.renderedChatMessages) {
-        vscode.window.showWarningMessage("rendered_chat_messages not found for this CallModelAction step.");
+      const payload = extractCallModelPayloadForStep(events, stepIndex);
+      if (!hasCallModelPayload(payload)) {
+        vscode.window.showWarningMessage("No model payload found for this CallModelAction step.");
         return;
       }
 
       const text = formatCallModelPayloadForClipboard(payload.renderedChatMessages, payload.modelResponse);
       await vscode.env.clipboard.writeText(text);
-      vscode.window.showInformationMessage("Copied rendered_chat_messages + model_response to clipboard.");
+      vscode.window.showInformationMessage("Copied model payload to clipboard.");
     })
   );
 
@@ -331,12 +321,14 @@ class RenderedPromptCodeLensProvider implements vscode.CodeLensProvider {
 class TraceStepItem extends vscode.TreeItem {
   readonly kind: "openPuml" | "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
   readonly stepIndex?: number;
+  readonly documentUri?: string;
   readonly isCallModelAction?: boolean;
 
   constructor(args: {
     kind: "openPuml" | "openLatest" | "step" | "callModelOpenMd" | "callModelCopy";
     label: string;
     stepIndex?: number;
+    documentUri?: string;
     isCallModelAction?: boolean;
     description?: string;
     tooltip?: string;
@@ -349,13 +341,18 @@ class TraceStepItem extends vscode.TreeItem {
     super(args.label, collapsible);
     this.kind = args.kind;
     this.stepIndex = args.stepIndex;
+    this.documentUri = args.documentUri;
     this.isCallModelAction = args.isCallModelAction;
     this.description = args.description;
     this.tooltip = args.tooltip;
 
     if (args.kind === "openPuml") {
       this.iconPath = new vscode.ThemeIcon("symbol-class");
-      this.command = { command: CMD_TRACE_OPEN_PUML, title: "Open PUML diagram" };
+      this.command = {
+        command: CMD_TRACE_OPEN_PUML,
+        title: "Open PUML diagram",
+        arguments: [{ documentUri: args.documentUri }]
+      };
       return;
     }
 
@@ -370,7 +367,7 @@ class TraceStepItem extends vscode.TreeItem {
       this.command = {
         command: CMD_TRACE_OPEN_STEP_DELTA,
         title: "Open Step Delta",
-        arguments: [{ stepIndex: args.stepIndex }]
+        arguments: [{ stepIndex: args.stepIndex, documentUri: args.documentUri }]
       };
       return;
     }
@@ -380,7 +377,7 @@ class TraceStepItem extends vscode.TreeItem {
       this.command = {
         command: CMD_TRACE_OPEN_CALLMODEL_MD,
         title: "Open messages as markdown",
-        arguments: [{ stepIndex: args.stepIndex }]
+        arguments: [{ stepIndex: args.stepIndex, documentUri: args.documentUri }]
       };
       return;
     }
@@ -390,7 +387,7 @@ class TraceStepItem extends vscode.TreeItem {
       this.command = {
         command: CMD_TRACE_COPY_CALLMODEL,
         title: "Copy messages and response",
-        arguments: [{ stepIndex: args.stepIndex }]
+        arguments: [{ stepIndex: args.stepIndex, documentUri: args.documentUri }]
       };
       return;
     }
@@ -401,6 +398,7 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<TraceStepItem | undefined | null | void>();
   readonly onDidChangeTreeData: vscode.Event<TraceStepItem | undefined | null | void> = this._onDidChangeTreeData.event;
   private buildStamp: string;
+  private lastTraceDocumentUri: string | null = null;
 
   constructor(initialBuildStamp: string) {
     this.buildStamp = initialBuildStamp;
@@ -424,24 +422,38 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
         return Promise.resolve([
           new TraceStepItem({
             kind: "callModelOpenMd",
-            label: "Open messages as MD",
-            stepIndex: element.stepIndex
+            label: "Open model payload as MD",
+            stepIndex: element.stepIndex,
+            documentUri: element.documentUri
           }),
           new TraceStepItem({
             kind: "callModelCopy",
-            label: "Copy messages + response",
-            stepIndex: element.stepIndex
+            label: "Copy model payload",
+            stepIndex: element.stepIndex,
+            documentUri: element.documentUri
           })
         ]);
       }
       return Promise.resolve([]);
     }
 
+    let doc = vscode.window.activeTextEditor?.document ?? null;
+    let sourceEvents = doc ? parseTraceEventsFromActiveDocument(doc) : [];
+
+    if (doc && sourceEvents.length) {
+      this.lastTraceDocumentUri = doc.uri.toString();
+    } else if (this.lastTraceDocumentUri) {
+      doc = await resolveTraceDocument(this.lastTraceDocumentUri);
+      sourceEvents = doc ? parseTraceEventsFromActiveDocument(doc) : [];
+    }
+
+    const docUri = doc?.uri.toString();
     const out: TraceStepItem[] = [
       new TraceStepItem({
         kind: "openPuml",
         label: "PUML",
-        description: "diagram activity"
+        description: "diagram activity",
+        documentUri: docUri
       }),
       new TraceStepItem({
         kind: "openLatest",
@@ -450,11 +462,8 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
       })
     ];
 
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return Promise.resolve(out);
+    if (!doc) return Promise.resolve(out);
 
-    const doc = editor.document;
-    const sourceEvents = parseTraceEventsFromActiveDocument(doc);
     const events = normalizeEventsForPuml(sourceEvents);
     if (!events.length) return Promise.resolve(out);
     const sourceIndexByEvent = new Map<TraceEvent, number>();
@@ -502,6 +511,7 @@ class TraceExplorerProvider implements vscode.TreeDataProvider<TraceStepItem> {
         kind: "step",
         label: title,
         stepIndex: sourceIndexByEvent.get(ev) ?? i,
+        documentUri: docUri,
         isCallModelAction,
         description,
         tooltip
@@ -598,6 +608,29 @@ function formatChatMessagesAsMarkdown(messages: any): string {
 function parseTraceEventsFromActiveDocument(doc: vscode.TextDocument): TraceEvent[] {
   const text = doc.getText().trim();
   return parseTraceEventsFromText(text);
+}
+
+async function resolveTraceDocument(documentUri?: string): Promise<vscode.TextDocument | null> {
+  if (typeof documentUri === "string" && documentUri.trim()) {
+    try {
+      return await vscode.workspace.openTextDocument(vscode.Uri.parse(documentUri));
+    } catch {
+      return null;
+    }
+  }
+  return vscode.window.activeTextEditor?.document ?? null;
+}
+
+async function showMarkdownContent(content: string, beside: boolean): Promise<void> {
+  const outDoc = await vscode.workspace.openTextDocument({
+    content,
+    language: "markdown"
+  });
+
+  await vscode.window.showTextDocument(outDoc, {
+    preview: false,
+    viewColumn: beside ? vscode.ViewColumn.Beside : undefined
+  });
 }
 
 function parseTraceEventsFromText(text: string): TraceEvent[] {
@@ -776,11 +809,8 @@ function formatStepInfoOnlyAsMarkdown(events: TraceEvent[]): string {
  * Produces: "1. Id: <stepId>, class: <className>"
  */
 function formatStepTitle(ev: TraceEvent, index: number): string {
-  const structuredId = asNonEmptyString(ev?.step?.id) ?? "";
+  const structuredId = getEventStepId(ev);
   const structuredClass = asNonEmptyString(ev?.action?.class) ?? "";
-
-  const explicitId =
-    asNonEmptyString(ev.step_id) ?? asNonEmptyString(ev.stepId) ?? asNonEmptyString(ev.action_step_id) ?? "";
 
   const explicitClass =
     asNonEmptyString(ev.action_name) ?? asNonEmptyString(ev.actionName) ?? asNonEmptyString(ev.action) ?? asNonEmptyString(ev.type) ?? "";
@@ -792,11 +822,21 @@ function formatStepTitle(ev: TraceEvent, index: number): string {
     inferred = asNonEmptyString(trace[trace.length - 1]) ?? "";
   }
 
-  const id = structuredId || explicitId || inferred || "step";
+  const id = structuredId || inferred || "step";
   const cls = structuredClass || explicitClass || inferred || "unknown";
 
   const prefix = `${index + 1}.`;
   return `${prefix} Id: ${id}, class: ${cls}`;
+}
+
+function getEventStepId(ev: TraceEvent): string {
+  return (
+    asNonEmptyString(ev?.step?.id) ??
+    asNonEmptyString(ev.step_id) ??
+    asNonEmptyString(ev.stepId) ??
+    asNonEmptyString(ev.action_step_id) ??
+    ""
+  );
 }
 
 function formatStepHeaderAsMarkdown(ev: TraceEvent): string {
@@ -983,61 +1023,182 @@ function getPreferredWorkspaceRoot(): vscode.Uri | null {
   return vscode.workspace.workspaceFolders?.[0]?.uri ?? null;
 }
 
-function extractCallModelPayload(ev: TraceEvent): { renderedChatMessages: any[] | null; modelResponse: string | null } {
-  const renderedCandidates = [
-    ev?.out?.rendered_chat_messages,
-    ev?.rendered_chat_messages,
-    ev?.action_output?.rendered_chat_messages,
-    getStateAfter(ev)?.rendered_chat_messages
-  ];
-
+function extractCallModelPayloadForStep(
+  events: TraceEvent[],
+  stepIndex: number
+): { renderedChatMessages: any[] | null; modelResponse: string | null } {
+  const candidateIndexes = getCallModelPayloadCandidateIndexes(events, stepIndex);
   let renderedChatMessages: any[] | null = null;
-  for (const c of renderedCandidates) {
-    if (Array.isArray(c)) {
-      renderedChatMessages = c;
-      break;
-    }
-    if (typeof c === "string") {
-      try {
-        const parsed = JSON.parse(c);
-        if (Array.isArray(parsed)) {
-          renderedChatMessages = parsed;
-          break;
-        }
-      } catch {
-        // ignore invalid candidate
-      }
-    }
-  }
-
-  const modelResponseCandidates = [
-    ev?.out?.model_response,
-    ev?.model_response,
-    ev?.action_output?.model_response,
-    getStateAfter(ev)?.model_response
-  ];
-
   let modelResponse: string | null = null;
-  for (const c of modelResponseCandidates) {
-    if (typeof c === "string" && c.trim()) {
-      modelResponse = c;
-      break;
+
+  for (const idx of candidateIndexes) {
+    const payload = extractCallModelPayloadFromEvent(events[idx]);
+    if (!renderedChatMessages && payload.renderedChatMessages) {
+      renderedChatMessages = payload.renderedChatMessages;
     }
+    if (!modelResponse && payload.modelResponse) {
+      modelResponse = payload.modelResponse;
+    }
+    if (renderedChatMessages && modelResponse) break;
   }
 
   return { renderedChatMessages, modelResponse };
 }
 
-function formatCallModelPayloadAsMarkdown(messages: any[], modelResponse: string | null): string {
+function getCallModelPayloadCandidateIndexes(events: TraceEvent[], stepIndex: number): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const push = (idx: number) => {
+    if (idx < 0 || idx >= events.length || seen.has(idx)) return;
+    seen.add(idx);
+    out.push(idx);
+  };
+
+  push(stepIndex);
+
+  const stepId = getEventStepId(events[stepIndex]);
+  if (!stepId) return out;
+
+  const localWindow = 8;
+  for (let offset = 1; offset <= localWindow; offset++) {
+    const prev = stepIndex - offset;
+    if (prev >= 0 && isRelatedStepEvent(events[prev], stepId)) push(prev);
+
+    const next = stepIndex + offset;
+    if (next < events.length && isRelatedStepEvent(events[next], stepId)) push(next);
+  }
+
+  const broadMatches = events
+    .map((ev, idx) => ({ ev, idx }))
+    .filter(({ ev, idx }) => idx !== stepIndex && isRelatedStepEvent(ev, stepId))
+    .sort((a, b) => Math.abs(a.idx - stepIndex) - Math.abs(b.idx - stepIndex));
+
+  for (const match of broadMatches) {
+    push(match.idx);
+  }
+
+  return out;
+}
+
+function isRelatedStepEvent(ev: TraceEvent, stepId: string): boolean {
+  const relatedIds = [
+    getEventStepId(ev),
+    asNonEmptyString(ev.consumer_step_id) ?? "",
+    asNonEmptyString(ev.consumerStepId) ?? "",
+    asNonEmptyString(ev.producer_step_id) ?? "",
+    asNonEmptyString(ev.producerStepId) ?? ""
+  ];
+  return relatedIds.some((id) => id === stepId);
+}
+
+function extractCallModelPayloadFromEvent(ev: TraceEvent): { renderedChatMessages: any[] | null; modelResponse: string | null } {
+  const nestedRenderedCandidates = collectNestedValuesByKeys(ev, ["rendered_chat_messages", "renderedChatMessages"]);
+  const renderedCandidates = [
+    ev?.out?.rendered_chat_messages,
+    ev?.out?.renderedChatMessages,
+    ev?.rendered_chat_messages,
+    ev?.renderedChatMessages,
+    ev?.action_output?.rendered_chat_messages,
+    ev?.action_output?.renderedChatMessages,
+    getStateAfter(ev)?.rendered_chat_messages,
+    getStateAfter(ev)?.renderedChatMessages,
+    ...nestedRenderedCandidates
+  ];
+
+  let renderedChatMessages: any[] | null = null;
+  for (const c of renderedCandidates) {
+    const parsed = tryParseMessagesCandidate(c);
+    if (!parsed) continue;
+    renderedChatMessages = parsed;
+    break;
+  }
+
+  const nestedModelResponseCandidates = collectNestedValuesByKeys(ev, ["model_response", "modelResponse"]);
+  const modelResponseCandidates = [
+    ev?.out?.model_response,
+    ev?.out?.modelResponse,
+    ev?.model_response,
+    ev?.modelResponse,
+    ev?.action_output?.model_response,
+    ev?.action_output?.modelResponse,
+    getStateAfter(ev)?.model_response,
+    getStateAfter(ev)?.modelResponse,
+    ...nestedModelResponseCandidates
+  ];
+
+  let modelResponse: string | null = null;
+  for (const c of modelResponseCandidates) {
+    const parsed = tryParseStringCandidate(c);
+    if (!parsed) continue;
+    modelResponse = parsed;
+    break;
+  }
+
+  return { renderedChatMessages, modelResponse };
+}
+
+function collectNestedValuesByKeys(root: any, keys: string[]): any[] {
+  const matches: any[] = [];
+  const wanted = new Set(keys);
+  const seen = new Set<any>();
+  const stack = [root];
+
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    if (Array.isArray(current)) {
+      for (let i = current.length - 1; i >= 0; i--) {
+        stack.push(current[i]);
+      }
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(current)) {
+      if (wanted.has(key)) matches.push(value);
+      if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+
+  return matches;
+}
+
+function tryParseMessagesCandidate(candidate: any): any[] | null {
+  if (Array.isArray(candidate)) return candidate;
+  if (typeof candidate !== "string") return null;
+
+  try {
+    const parsed = JSON.parse(candidate);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryParseStringCandidate(candidate: any): string | null {
+  return typeof candidate === "string" && candidate.trim() ? candidate : null;
+}
+
+function hasCallModelPayload(payload: { renderedChatMessages: any[] | null; modelResponse: string | null }): boolean {
+  return Array.isArray(payload.renderedChatMessages) || !!payload.modelResponse;
+}
+
+function formatCallModelPayloadAsMarkdown(messages: any[] | null, modelResponse: string | null): string {
   const parts: string[] = [];
-  parts.push(formatChatMessagesAsMarkdown(messages));
+  if (messages && messages.length) {
+    parts.push(formatChatMessagesAsMarkdown(messages));
+  } else {
+    parts.push("# rendered_chat_messages\n");
+    parts.push("_(not present in this trace for this step)_\n");
+  }
 
   parts.push("\n# model_response\n");
   if (modelResponse && modelResponse.trim()) {
-    parts.push("```text\n");
-    parts.push(modelResponse);
-    if (!modelResponse.endsWith("\n")) parts.push("\n");
-    parts.push("```\n");
+    parts.push(formatMarkdownCodeBlock(modelResponse));
   } else {
     parts.push("_model_response is empty or missing._\n");
   }
@@ -1045,12 +1206,34 @@ function formatCallModelPayloadAsMarkdown(messages: any[], modelResponse: string
   return parts.join("");
 }
 
-function formatCallModelPayloadForClipboard(messages: any[], modelResponse: string | null): string {
+function formatCallModelPayloadForClipboard(messages: any[] | null, modelResponse: string | null): string {
   const parts: string[] = [];
-  parts.push(formatChatMessagesAsMarkdown(messages));
+  parts.push("# rendered_chat_messages\n");
+  if (messages && messages.length) {
+    parts.push(formatChatMessagesAsMarkdown(messages));
+  } else {
+    parts.push("_(not present in this trace for this step)_\n");
+  }
   parts.push("\n# model_response\n");
   parts.push(modelResponse ?? "");
   parts.push("\n");
+  return parts.join("");
+}
+
+function formatMarkdownCodeBlock(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\`\n`;
+    } catch {
+      // Fallback to plain text block when content is not valid JSON.
+    }
+  }
+
+  const parts = ["```text\n", value];
+  if (!value.endsWith("\n")) parts.push("\n");
+  parts.push("```\n");
   return parts.join("");
 }
 
@@ -1364,10 +1547,10 @@ function encode6bit(b: number): string {
   return "?";
 }
 
-async function loadEventsForPuml(): Promise<TraceEvent[]> {
-  const editor = vscode.window.activeTextEditor;
-  if (editor) {
-    const events = parseTraceEventsFromActiveDocument(editor.document);
+async function loadEventsForPuml(documentUri?: string): Promise<TraceEvent[]> {
+  const doc = await resolveTraceDocument(documentUri);
+  if (doc) {
+    const events = parseTraceEventsFromActiveDocument(doc);
     const filtered = normalizeEventsForPuml(events);
     if (filtered.length) return filtered;
   }

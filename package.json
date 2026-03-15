@@ -2,7 +2,7 @@
   "name": "rag-debug-toolkit",
   "displayName": "RAG Debug Toolkit",
   "description": "A simple VS Code extension for debugging RAG pipelines.",
-  "version": "0.0.15",
+  "version": "0.0.17",
   "publisher": "local",
   "license": "MIT",
   "repository": {
